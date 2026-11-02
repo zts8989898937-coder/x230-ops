@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""wp-post <markdown 文件> [--title 标题] [--status draft|publish] [--tags 1,2] [--category id]
+把 Markdown 发到 stillfloating.top 的 WordPress（应用密码认证，凭据见 ~/.config/secrets/wordpress.app）
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+import urllib.request
+
+CREDS = os.path.expanduser("~/.config/secrets/wordpress.app")
+
+
+def creds():
+    d = {}
+    for line in open(CREDS, encoding="utf-8"):
+        if ":" in line:
+            k, v = line.split(":", 1)
+            d[k.strip()] = v.strip()
+    return d["site"], d["user"], d["app_password"]
+
+
+def md2html(md_text):
+    try:
+        import markdown
+    except ImportError:
+        sys.exit("缺少 markdown 模块：pip install markdown")
+    return markdown.markdown(md_text, extensions=["extra", "fenced_code", "tables", "toc", "sane_lists"])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("file")
+    ap.add_argument("--title", default="")
+    ap.add_argument("--status", default="draft", choices=["draft", "publish", "private"])
+    ap.add_argument("--excerpt", default="")
+    a = ap.parse_args()
+
+    text = open(a.file, encoding="utf-8").read()
+    title = a.title
+    if not title:
+        m = re.search(r"^#\s+(.+)$", text, re.M)
+        title = m.group(1).strip() if m else os.path.basename(a.file)
+
+    site, user, app = creds()
+    payload = json.dumps({
+        "title": title,
+        "content": md2html(text),
+        "status": a.status,
+        "excerpt": a.excerpt,
+    }).encode()
+    req = urllib.request.Request(f"{site}/wp-json/wp/v2/posts", data=payload, method="POST")
+    token = base64.b64encode(f"{user}:{app}".encode()).decode()
+    req.add_header("Authorization", f"Basic {token}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"HTTP {e.code}: {e.read()[:300]}")
+    print(f"ok id={data['id']} status={data['status']}")
+    print(f"link: {data.get('link')}")
+    print(f"edit: {site}/wp-admin/post.php?post={data['id']}&action=edit")
+
+
+if __name__ == "__main__":
+    main()

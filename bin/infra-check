@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""infra-check — 一键巡检本机所有关键服务/账号/链路
+
+巡检项：
+  系统   负载、内存、磁盘、温度
+  服务   dsh-web(:3080)、agy-bridge(:8899)、WordPress 站点
+  账号   Gmail IMAP(经代理)、WP REST API、Antigravity 额度
+  网络   Clash(:7897)、出口 IP 与节点、Google、OpenAI(chatgpt)
+  远端   香港服务器 SSH
+用法:
+  infra-check            # 文本报告
+  infra-check --json     # 机器可读
+  infra-check --push     # 额外推 ntfy（topic 见 ~/.config/secrets/ntfy.* 或环境变量 NTFY_TOPIC）
+  infra-check --quiet    # 只打印失败项
+退出码: 0 全好 / 1 有告警 / 2 有严重失败
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+HOME = os.path.expanduser("~")
+PROXY = "http://127.0.0.1:7897"
+WP_CREDS = f"{HOME}/.config/secrets/wordpress.app"
+
+
+def sh(cmd, timeout=12, env=None):
+    try:
+        r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True,
+                           text=True, timeout=timeout, env=env)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+    except Exception as e:
+        return 1, str(e)
+
+
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
+
+
+def curl_code(url, proxy=None, timeout=12, auth=None):
+    cmd = ["curl", "-sS", "-o", "/dev/null", "-m", str(timeout), "-w", "%{http_code}",
+           "-A", UA, url]
+    if proxy:
+        cmd += ["-x", proxy]
+    if auth:
+        cmd += ["-u", auth]
+    rc, out = sh(cmd, timeout=timeout + 3)
+    return out.strip() if rc == 0 else "ERR"
+
+
+def check_system():
+    load = os.getloadavg()[0]
+    mem = {}
+    for line in open("/proc/meminfo"):
+        k, v = line.split(":")
+        mem[k] = int(v.split()[0])
+    mem_used_g = (mem["MemTotal"] - mem["MemAvailable"]) / 1024 / 1024
+    mem_total_g = mem["MemTotal"] / 1024 / 1024
+    du = shutil.disk_usage("/")
+    pct = du.used / du.total * 100
+    temp = None
+    try:
+        temp = int(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000
+    except Exception:
+        pass
+    ok = load < 8 and pct < 90 and (temp is None or temp < 85)
+    return {"name": f"系统 负载{load:.2f} 内存{mem_used_g:.1f}/{mem_total_g:.1f}G "
+                    f"磁盘{pct:.0f}%" + (f" 温度{temp:.0f}°C" if temp else ""),
+            "ok": ok, "detail": ""}
+
+
+def check_dsh():
+    code = curl_code("http://100.110.77.111:3080/")
+    return {"name": "dsh-web :3080", "ok": code in ("200", "401"), "detail": f"http={code}"}
+
+
+def check_bridge():
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8899/health", timeout=8) as r:
+            d = json.load(r)
+        return {"name": "agy-bridge :8899", "ok": d.get("ok", False), "detail": f"{d.get('models')} 个模型"}
+    except Exception as e:
+        return {"name": "agy-bridge :8899", "ok": False, "detail": str(e)[:60]}
+
+
+def check_wp_site():
+    code = curl_code("https://stillfloating.top/", timeout=12)
+    return {"name": "WordPress 站点", "ok": code == "200", "detail": f"http={code}"}
+
+
+def check_wp_api():
+    d = {}
+    for line in open(WP_CREDS):
+        if ":" in line:
+            k, v = line.split(":", 1)
+            d[k.strip()] = v.strip()
+    auth = f"{d['user']}:{d['app_password']}"
+    code = curl_code(f"{d['site']}/wp-json/wp/v2/users/me", auth=auth, timeout=12)
+    return {"name": "WP REST API", "ok": code == "200", "detail": f"http={code} user={d['user']}"}
+
+
+def check_gmail():
+    rc, out = sh(f"{HOME}/.local/bin/gmail whoami", timeout=60)
+    m = re.search(r"INBOX 共 (\d+) 封", out)
+    return {"name": "Gmail IMAP", "ok": rc == 0 and bool(m),
+            "detail": (f"{m.group(1)} 封" if m else out.strip().splitlines()[-1][:60] if out.strip() else "fail")}
+
+
+def check_quota():
+    rc, out = sh(f"{HOME}/.local/bin/agy-usage --quiet", timeout=120)
+    return {"name": "Antigravity 额度", "ok": rc == 0 and "GEMINI=" in out,
+            "detail": out.strip().replace("GEMINI=", "Gemini 周").replace(" CLAUDE=", " / Claude 周")
+                      .replace(" ARGON=", " / Argon ") if rc == 0 else out.strip()[:60]}
+
+
+def check_clash():
+    try:
+        s = socket.create_connection(("127.0.0.1", 7897), timeout=5)
+        s.close()
+        return {"name": "Clash 代理 :7897", "ok": True, "detail": "可连"}
+    except Exception as e:
+        return {"name": "Clash 代理 :7897", "ok": False, "detail": str(e)[:60]}
+
+
+def check_egress():
+    rc, out = sh(["curl", "-sS", "-m", "12", "-x", PROXY, "https://api.ipify.org"], timeout=16)
+    ip = out.strip()
+    if rc != 0 or not ip:
+        return {"name": "出口 IP", "ok": False, "detail": out.strip()[:60]}
+    rc2, loc = sh(["curl", "-sS", "-m", "12", "-x", PROXY, f"https://ipinfo.io/{ip}/json"], timeout=16)
+    region = ""
+    try:
+        region = json.loads(loc).get("country", "") + " " + json.loads(loc).get("city", "")
+    except Exception:
+        pass
+    return {"name": f"出口 IP {ip} {region}".strip(), "ok": True, "detail": ""}
+
+
+def check_site(name, url, good=("200",)):
+    code = curl_code(url, proxy=PROXY, timeout=15)
+    return {"name": name, "ok": code in good, "detail": f"http={code}"}
+
+
+def check_hk():
+    rc, out = sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "hk", "hostname"], timeout=15)
+    return {"name": "香港服务器 SSH", "ok": rc == 0, "detail": (out.strip() or "fail")[:40]}
+
+
+def push_ntfy(text):
+    topic = os.environ.get("NTFY_TOPIC") or ""
+    if not topic:
+        for p in (f"{HOME}/.config/secrets/ntfy.topic",):
+            if os.path.exists(p):
+                topic = open(p).read().strip()
+    if not topic:
+        print("（未配置 ntfy topic，跳过推送）", file=sys.stderr)
+        return
+    try:
+        req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=text.encode(), method="POST")
+        req.add_header("Title", "infra-check")
+        urllib.request.urlopen(req, timeout=10)
+        print("已推送 ntfy")
+    except Exception as e:
+        print(f"ntfy 推送失败: {e}", file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--push", action="store_true")
+    a = ap.parse_args()
+
+    t0 = time.time()
+    tasks = [check_system, check_dsh, check_bridge, check_wp_site, check_wp_api,
+             check_gmail, check_quota, check_clash, check_egress, check_hk,
+             lambda: check_site("Google", "https://www.google.com/"),
+             lambda: check_site("OpenAI chatgpt", "https://chatgpt.com/")]
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        results = list(ex.map(lambda f: f(), tasks))
+    results.sort(key=lambda r: not r["ok"])
+
+    bad = [r for r in results if not r["ok"]]
+    code = 2 if any("SSH" in r["name"] or "Clash" in r["name"] for r in bad) else (1 if bad else 0)
+
+    if a.json:
+        print(json.dumps({"ok": not bad, "elapsed": round(time.time() - t0, 1), "checks": results},
+                         ensure_ascii=False, indent=1))
+    else:
+        print(f"== infra-check {time.strftime('%F %T')}（{time.time()-t0:.1f}s）==")
+        for r in results:
+            if a.quiet and r["ok"]:
+                continue
+            mark = "✓" if r["ok"] else "✗"
+            print(f" {mark} {r['name']}" + (f"   {r['detail']}" if r["detail"] else ""))
+        if bad:
+            print(f"== {len(bad)} 项异常 ==")
+        else:
+            print("== 全部正常 ==")
+
+    if a.push and bad:
+        push_ntfy("\n".join(f"✗ {r['name']} {r['detail']}" for r in bad))
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""agy-usage — 查看 Antigravity 额度（Gemini 池 / Claude+GPT 池 / Gemini 4 Argon 周额度）
+
+用法:
+  agy-usage           表格
+  agy-usage --quiet   形如 GEMINI=92 CLAUDE=99 ARGON=97
+  agy-usage --json    JSON 列表
+"""
+import json
+import os
+import subprocess
+import sys
+
+AGY = os.environ.get("AGY_BIN") or os.path.expanduser("~/.local/bin/agy")
+
+
+def fetch():
+    try:
+        out = subprocess.run([AGY, "-p", "/usage"], cwd="/tmp", capture_output=True,
+                             text=True, timeout=150)
+    except subprocess.TimeoutExpired:
+        sys.exit("取额度超时")
+    text = (out.stdout or "") + (out.stderr or "")
+    rows = []
+    for line in text.splitlines():
+        p = line.rstrip("\n").split("\t")
+        if len(p) >= 3 and p[1].strip().lower().endswith("remaining"):
+            try:
+                left = int(p[2].strip().rstrip("%"))
+            except ValueError:
+                continue
+            rows.append({"pool": p[0].strip(), "kind": p[1].strip(), "left": left,
+                         "reset": p[3].strip() if len(p) > 3 else ""})
+    if not rows:
+        sys.exit("取额度失败，原始输出：\n" + text[:500])
+    return rows
+
+
+def pick(rows, sub):
+    for r in rows:
+        if sub in r["pool"] and "Weekly" in r["kind"]:
+            return r["left"]
+    return None
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    rows = fetch()
+    if mode == "--json":
+        print(json.dumps(rows, ensure_ascii=False))
+        return
+    if mode == "--quiet":
+        print(f"GEMINI={pick(rows, 'Gemini Models')} CLAUDE={pick(rows, 'Claude')} "
+              f"ARGON={next((r['left'] for r in rows if 'Argon' in r['pool']), None)}")
+        return
+    print(f"{'池':<24}{'窗口':<28}{'剩余':>6}  重置时间")
+    print("-" * 80)
+    for r in rows:
+        print(f"{r['pool']:<24}{r['kind']:<28}{str(r['left']) + '%':>6}  {r['reset']}")
+
+
+if __name__ == "__main__":
+    main()
