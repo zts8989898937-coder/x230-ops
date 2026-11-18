@@ -79,7 +79,7 @@ def check_system():
 
 
 def check_dsh():
-    code = curl_code("http://100.110.77.111:3080/")
+    code = curl_code("http://192.0.2.20:3080/")
     return {"name": "dsh-web :3080", "ok": code in ("200", "401"), "detail": f"http={code}"}
 
 

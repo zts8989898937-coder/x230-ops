@@ -27,7 +27,7 @@
  ✓ Gmail IMAP           16 封
  ✓ Antigravity 额度     Gemini 周99 / Claude 周96
  ✓ Clash 代理 :7897     可连
- ✓ 出口 IP              133.18.114.145
+ ✓ 出口 IP              198.51.100.10
  ✓ 香港服务器 SSH        OK
  ✓ Google               http=200
  ✓ OpenAI chatgpt       http=200
@@ -83,3 +83,7 @@ DSH / 自建 Agent ──(OpenAI 协议)──> agy-bridge :8899 ──> agy -p 
 ## 许可
 
 MIT。脚本里的路径/凭据都从环境或 `~/.config/secrets/` 读取，仓库里**不含任何密钥**。
+
+## 公开版本说明
+
+部署参数使用示例值。公开范围见 [PUBLIC_SCOPE.md](PUBLIC_SCOPE.md)，通用框架和路线见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 与 [docs/ROADMAP.md](docs/ROADMAP.md)。
